@@ -1,0 +1,203 @@
+#include <convol/subsampling.h>
+#include <convol/random.h>
+
+namespace CNN
+{
+
+Subsampling::Subsampling(OutputInfo info, int kernelRows, int kernelCols,bool bias, ActivationFunction act, double stdDev,Regularization regularization)
+  : I(info.outputs()), fm(info.dimensions[0]), inRows(info.dimensions[1]),
+    inCols(info.dimensions[2]), kernelRows(kernelRows),
+    kernelCols(kernelCols), bias(bias), act(act), stdDev(stdDev), x(0),
+    e(1, I), fmInSize(-1), outRows(-1), outCols(-1), fmOutSize(-1),
+    maxRow(-1), maxCol(-1), regularization(regularization)
+{
+}
+
+OutputInfo Subsampling::initialize(std::vector<double*>& parameterPointers,
+                                   std::vector<double*>& parameterDerivativePointers)
+{
+  OutputInfo info;
+  info.dimensions.push_back(fm);
+  outRows = inRows / kernelRows;
+  outCols = inCols / kernelCols;
+  fmOutSize = outRows * outCols;
+  info.dimensions.push_back(outRows);
+  info.dimensions.push_back(outCols);
+  fmInSize = inRows * inCols;
+  maxRow = inRows - kernelRows + 1;
+  maxCol = inCols - kernelCols + 1;
+
+  W.resize(fm, Eigen::MatrixXd(outRows, outCols));
+  Wd.resize(fm, Eigen::MatrixXd(outRows, outCols));
+  int numParams = fm * outRows * outCols * kernelRows * kernelCols;
+  if(bias)
+  {
+    Wb.resize(fm, Eigen::MatrixXd(outRows, outCols));
+    Wbd.resize(fm, Eigen::MatrixXd(outRows, outCols));
+    numParams += fm * outRows * outCols;
+  }
+  parameterPointers.reserve(parameterPointers.size() + numParams);
+  parameterDerivativePointers.reserve(parameterDerivativePointers.size() + numParams);
+  for(int fmo = 0; fmo < fm; fmo++)
+  {
+    for(int r = 0; r < outRows; r++)
+    {
+      for(int c = 0; c < outCols; c++)
+      {
+        parameterPointers.push_back(&W[fmo](r, c));
+        parameterDerivativePointers.push_back(&Wd[fmo](r, c));
+        if(bias)
+        {
+          parameterPointers.push_back(&Wb[fmo](r, c));
+          parameterDerivativePointers.push_back(&Wbd[fmo](r, c));
+        }
+      }
+    }
+  }
+
+  initializeParameters();
+
+  a.resize(1, info.outputs());
+  y.resize(1, info.outputs());
+  yd.resize(1, info.outputs());
+  deltas.resize(1, info.outputs());
+
+  return info;
+}
+
+void Subsampling::initializeParameters()
+{
+  RandomNumberGenerator rng;
+  for(int fmo = 0; fmo < fm; fmo++)
+  {
+    rng.fillNormalDistribution(W[fmo], stdDev);
+    if(bias)
+      rng.fillNormalDistribution(Wb[fmo], stdDev);
+  }
+}
+
+void Subsampling::forwardPropagate(Eigen::MatrixXd* x, Eigen::MatrixXd*& y,
+                                   bool dropout, double* error)
+{
+  const int N = x->rows();
+  this->a.conservativeResize(N, Eigen::NoChange);
+  this->y.conservativeResize(N, Eigen::NoChange);
+  this->x = x;
+
+
+  a.setZero();
+  for(int n = 0; n < N; n++)
+  {
+    int outputIdx = 0;
+    for(int fmo = 0; fmo < fm; fmo++)
+    {
+      for(int ri = 0, ro = 0; ri < maxRow; ri += kernelRows, ro++)
+      {
+        int rowBase = fmo * fmInSize + ri * inCols;
+        for(int ci = 0, co = 0; ci < maxCol; ci += kernelCols, co++, outputIdx++)
+        {
+          for(int kr = 0; kr < kernelRows; kr++)
+          {
+            for(int kc = 0, inputIdx = rowBase + ci; kc < kernelCols; kc++)
+              a(n, outputIdx) += (*x)(n, inputIdx++) * W[fmo](ro, co);
+          }
+          if(bias)
+            a(n, outputIdx) += Wb[fmo](ro, co);
+        }
+      }
+    }
+  }
+
+  activationFunction(act, a, this->y);
+
+  if(error && regularization.l1Penalty > 0.0)
+    for(int fmo = 0; fmo < fm; fmo++)
+      *error += regularization.l1Penalty * W[fmo].array().abs().sum();
+  if(error && regularization.l2Penalty > 0.0)
+    for(int fmo = 0; fmo < fm; fmo++)
+      *error += regularization.l2Penalty * W[fmo].array().square().sum() / 2.0;
+
+  y = &(this->y);
+}
+
+void Subsampling::backpropagate(Eigen::MatrixXd* ein, Eigen::MatrixXd*& eout,
+                                bool backpropToPrevious)
+{
+  const int N = a.rows();
+  yd.conservativeResize(N, Eigen::NoChange);
+  e.conservativeResize(N, Eigen::NoChange);
+  // Derive activations
+  activationFunctionDerivative(act, y, yd);
+  deltas = yd.cwiseProduct(*ein);
+
+  e.setZero();
+  for(int fmo = 0; fmo < fm; fmo++)
+  {
+    Wd[fmo].setZero();
+    if(bias)
+      Wbd[fmo].setZero();
+  }
+
+  for(int n = 0; n < N; n++)
+  {
+    int outputIdx = 0;
+    for(int fmo = 0; fmo < fm; fmo++)
+    {
+      for(int ri = 0, ro = 0; ri < maxRow; ri += kernelRows, ro++)
+      {
+        int rowBase = fmo * fmInSize + ri * inCols;
+        for(int ci = 0, co = 0; ci < maxCol;
+            ci += kernelCols, co++, outputIdx++)
+        {
+          const double d = deltas(n, outputIdx);
+          for(int kr = 0; kr < kernelRows; kr++)
+          {
+            for(int kc = 0, inputIdx = rowBase + ci; kc < kernelCols;
+                kc++, inputIdx++)
+            {
+              e(n, inputIdx) += W[fmo](ro, co) * d;
+              Wd[fmo](ro, co) += d * (*x)(n, inputIdx);
+            }
+          }
+          if(bias)
+            Wbd[fmo](ro, co) += d;
+        }
+      }
+    }
+  }
+
+  if(regularization.l1Penalty > 0.0)
+  {
+    for(int fmo = 0; fmo < fm; fmo++)
+      Wd[fmo].array() += regularization.l1Penalty * W[fmo].array() / W[fmo].array().abs();
+  }
+  if(regularization.l2Penalty > 0.0)
+  {
+    for(int fmo = 0; fmo < fm; fmo++)
+      Wd[fmo] += regularization.l2Penalty * W[fmo];
+  }
+
+  eout = &e;
+}
+
+Eigen::MatrixXd& Subsampling::getOutput()
+{
+  return y;
+}
+
+Eigen::VectorXd Subsampling::getParameters()
+{
+  Eigen::VectorXd p((1+bias)*fm*outRows*outCols);
+  int idx = 0;
+  for(int fmo = 0; fmo < fm; fmo++)
+    for(int r = 0; r < outRows; r++)
+      for(int c = 0; c < outCols; c++)
+        p(idx++) = W[fmo](r, c);
+  if(bias)
+    for(int fmo = 0; fmo < fm; fmo++)
+      for(int r = 0; r < outRows; r++)
+        for(int c = 0; c < outCols; c++)
+          p(idx++) = W[fmo](r, c);
+  return p;
+}
+}
